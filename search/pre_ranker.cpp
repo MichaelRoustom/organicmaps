@@ -17,7 +17,6 @@
 
 #include <algorithm>
 #include <iterator>
-#include <set>
 
 namespace search
 {
@@ -25,10 +24,10 @@ using namespace std;
 
 namespace
 {
-void SweepNearbyResults(double xEps, double yEps, set<FeatureID> const & prevEmit,
+void SweepNearbyResults(m2::PointD const & eps, set<FeatureID> const & prevEmit,
                         vector<PreRankerResult> & results)
 {
-  m2::NearbyPointsSweeper sweeper(xEps, yEps);
+  m2::NearbyPointsSweeper sweeper(eps.x, eps.y);
   for (size_t i = 0; i < results.size(); ++i)
   {
     auto const & p = results[i].GetInfo().m_center;
@@ -46,9 +45,9 @@ void SweepNearbyResults(double xEps, double yEps, set<FeatureID> const & prevEmi
 
   vector<PreRankerResult> filtered;
   sweeper.Sweep([&filtered, &results](size_t i)
-                {
-                  filtered.push_back(move(results[i]));
-                });
+  {
+    filtered.push_back(move(results[i]));
+  });
 
   results.swap(filtered);
 }
@@ -142,15 +141,7 @@ void PreRanker::FillMissingFieldsInPreResults()
 
 void PreRanker::Filter(bool viewportSearch)
 {
-  struct LessFeatureID
-  {
-    inline bool operator()(PreRankerResult const & lhs, PreRankerResult const & rhs) const
-    {
-      return lhs.GetId() < rhs.GetId();
-    }
-  };
-
-  auto comparePreRankerResults = [](PreRankerResult const & lhs, PreRankerResult const & rhs)
+  auto const lessForUnique = [](PreRankerResult const & lhs, PreRankerResult const & rhs)
   {
     if (lhs.GetId() != rhs.GetId())
       return lhs.GetId() < rhs.GetId();
@@ -164,21 +155,14 @@ void PreRanker::Filter(bool viewportSearch)
     return lhs.GetInfo().InnermostTokenRange().Begin() < rhs.GetInfo().InnermostTokenRange().Begin();
   };
 
-  sort(m_results.begin(), m_results.end(), comparePreRankerResults);
-  m_results.erase(unique(m_results.begin(), m_results.end(), base::EqualsBy(&PreRankerResult::GetId)),
-                  m_results.end());
+  base::SortUnique(m_results, lessForUnique, base::EqualsBy(&PreRankerResult::GetId));
 
-  bool const centersLoaded = all_of(m_results.begin(), m_results.end(),
-             [](PreRankerResult const & result) { return result.GetInfo().m_centerLoaded; });
-
-  if (viewportSearch && centersLoaded)
-  {
+  if (viewportSearch)
     FilterForViewportSearch();
-    ASSERT_LESS_OR_EQUAL(m_results.size(), BatchSize(), ());
-    for (auto const & result : m_results)
-      m_currEmit.insert(result.GetId());
-  }
-  else if (m_results.size() > BatchSize())
+
+  if (m_results.size() <= BatchSize())
+    return;
+
   {
     sort(m_results.begin(), m_results.end(), &PreRankerResult::LessDistance);
 
@@ -213,35 +197,39 @@ void PreRanker::Filter(bool viewportSearch)
     shuffle(b, e, m_rng);
   }
 
+  struct LessFeatureID
+  {
+    inline bool operator()(PreRankerResult const & lhs, PreRankerResult const & rhs) const
+    {
+      return lhs.GetId() < rhs.GetId();
+    }
+  };
   set<PreRankerResult, LessFeatureID> filtered;
 
   auto const numResults = min(m_results.size(), BatchSize());
   filtered.insert(m_results.begin(), m_results.begin() + numResults);
 
-  if (!viewportSearch)
+  if (!m_params.m_categorialRequest)
   {
-    if (!m_params.m_categorialRequest)
-    {
-      nth_element(m_results.begin(), m_results.begin() + numResults, m_results.end(),
-                  &PreRankerResult::LessRankAndPopularity);
-      filtered.insert(m_results.begin(), m_results.begin() + numResults);
-      nth_element(m_results.begin(), m_results.begin() + numResults, m_results.end(),
-                  &PreRankerResult::LessByExactMatch);
-      filtered.insert(m_results.begin(), m_results.begin() + numResults);
-    }
-    else
-    {
-      double const kPedestrianRadiusMeters = 2500.0;
-      PreRankerResult::CategoriesComparator comparator;
-      comparator.m_positionIsInsideViewport =
-          m_params.m_position && m_params.m_viewport.IsPointInside(*m_params.m_position);
-      comparator.m_detailedScale = mercator::DistanceOnEarth(m_params.m_viewport.LeftTop(),
-                                                             m_params.m_viewport.RightBottom()) <
-                                   2 * kPedestrianRadiusMeters;
-      comparator.m_viewport = m_params.m_viewport;
-      nth_element(m_results.begin(), m_results.begin() + numResults, m_results.end(), comparator);
-      filtered.insert(m_results.begin(), m_results.begin() + numResults);
-    }
+    nth_element(m_results.begin(), m_results.begin() + numResults, m_results.end(),
+                &PreRankerResult::LessRankAndPopularity);
+    filtered.insert(m_results.begin(), m_results.begin() + numResults);
+    nth_element(m_results.begin(), m_results.begin() + numResults, m_results.end(),
+                &PreRankerResult::LessByExactMatch);
+    filtered.insert(m_results.begin(), m_results.begin() + numResults);
+  }
+  else
+  {
+    double const kPedestrianRadiusMeters = 2500.0;
+    PreRankerResult::CategoriesComparator comparator;
+    comparator.m_positionIsInsideViewport =
+        m_params.m_position && m_params.m_viewport.IsPointInside(*m_params.m_position);
+    comparator.m_detailedScale = mercator::DistanceOnEarth(m_params.m_viewport.LeftTop(),
+                                                           m_params.m_viewport.RightBottom()) <
+                                 2 * kPedestrianRadiusMeters;
+    comparator.m_viewport = m_params.m_viewport;
+    nth_element(m_results.begin(), m_results.begin() + numResults, m_results.end(), comparator);
+    filtered.insert(m_results.begin(), m_results.begin() + numResults);
   }
 
   m_results.assign(make_move_iterator(filtered.begin()), make_move_iterator(filtered.end()));
@@ -270,21 +258,24 @@ void PreRanker::ClearCaches()
 
 void PreRanker::FilterForViewportSearch()
 {
-  auto const & viewport = m_params.m_viewport;
-
-  base::EraseIf(m_results, [&](PreRankerResult const & result)
+  base::EraseIf(m_results, [this](PreRankerResult const & result)
   {
     auto const & info = result.GetInfo();
-    if (!viewport.IsPointInside(info.m_center))
+
+    // Interesting, is it possible when there is no center for a search result?
+    ASSERT(info.m_centerLoaded, (result.GetId()));
+    if (!info.m_centerLoaded || !m_params.m_viewport.IsPointInside(info.m_center))
       return true;
 
+    /// @todo Make some upper bound like for regular search, but not to erase partially matched results?
     return result.GetMatchedTokensNumber() + 1 < m_params.m_numQueryTokens;
   });
 
-  SweepNearbyResults(m_params.m_minDistanceOnMapBetweenResultsX,
-                     m_params.m_minDistanceOnMapBetweenResultsY, m_prevEmit, m_results);
+  /// @todo Comment next statements to discard viewport filtering (displacement) at all.
+  SweepNearbyResults(m_params.m_minDistanceOnMapBetweenResults, m_prevEmit, m_results);
 
-  CHECK_LESS_OR_EQUAL(m_results.size(), BatchSize(), ());
+  for (auto const & result : m_results)
+    m_currEmit.insert(result.GetId());
 }
 
 void PreRanker::FilterRelaxedResults(bool lastUpdate)
